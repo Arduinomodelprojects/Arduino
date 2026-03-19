@@ -1,0 +1,333 @@
+// ============================================================
+// S2 MINI -> IBT-2 / BTS7960 DC MOTOR CONTROLLER
+// For RC throttle control of a sidewheeler steam boat
+//
+// FEATURES
+// ------------------------------------------------------------
+// 1. Reads standard RC receiver pulse input on GPIO 7
+// 2. Drives an IBT-2 (BTS7960) high-current motor driver
+// 3. Provides a neutral deadband around stick center
+// 4. Adds hysteresis so the motor does not chatter near center
+// 5. Smoothly ramps PWM up and down for gentle operation
+// 6. Forces the output to ramp to zero before reversing direction
+//
+// WHY THIS VERSION WORKS WELL
+// ------------------------------------------------------------
+// A simple direct-mapped throttle often chatters near neutral,
+// especially with RC signal jitter. This sketch fixes that by:
+//
+// - using a neutral "stop zone"
+// - using wider thresholds to LEAVE stop than to RE-ENTER stop
+// - smoothing PWM changes so the motor does not jump suddenly
+//
+// This makes the control feel more realistic for boats,
+// locomotives, and other scale models.
+//
+// CONNECTIONS
+// ------------------------------------------------------------
+// RC Input signal  -> GPIO 7
+// IBT-2 R_EN       -> GPIO 3
+// IBT-2 L_EN       -> GPIO 4
+// IBT-2 RPWM       -> GPIO 5
+// IBT-2 LPWM       -> GPIO 6
+//
+// IMPORTANT
+// ------------------------------------------------------------
+// - Receiver ground, S2 ground, and IBT-2 ground must all be common
+// - IBT-2 motor power is separate from the S2 USB/logic power
+// - This sketch assumes standard RC pulse input of roughly 1000-2000 us
+//
+// ============================================================
+
+// -------------------------
+// Pin assignments
+// -------------------------
+const int PIN_RC   = 7;   // RC receiver signal input
+const int PIN_REN  = 3;   // IBT-2 Right Enable
+const int PIN_LEN  = 4;   // IBT-2 Left Enable
+const int PIN_RPWM = 5;   // IBT-2 Right PWM
+const int PIN_LPWM = 6;   // IBT-2 Left PWM
+
+// -------------------------
+// RC pulse limits
+// -------------------------
+// Typical RC throttle pulse range is near 1000 to 2000 us.
+// These values are mainly used for scaling throttle to PWM.
+// If your radio gives a wider or narrower range, adjust here.
+const int RC_MIN = 1000;
+const int RC_MAX = 2000;
+
+// -------------------------
+// Neutral stop zone settings
+// -------------------------
+//
+// STOP_ENTER_LOW / HIGH:
+//   Once the motor is already moving, it must come back into
+//   this narrow center band before the motor is considered "stopped".
+//
+// STOP_EXIT_LOW / HIGH:
+//   Once stopped, the stick must move farther away from center
+//   before motion begins again.
+//
+// This difference between ENTER and EXIT is called hysteresis,
+// and it helps prevent chatter near neutral.
+//
+// To make the center calmer:
+//   widen STOP_EXIT farther from center
+//
+// To make the controller more sensitive near center:
+//   move STOP_EXIT closer to center
+//
+const int STOP_ENTER_LOW  = 1485;
+const int STOP_ENTER_HIGH = 1515;
+
+const int STOP_EXIT_LOW   = 1440;
+const int STOP_EXIT_HIGH  = 1560;
+
+// -------------------------
+// PWM settings
+// -------------------------
+// PWM frequency and resolution for the ESP32-S2 LEDC system.
+//
+// PWM_FREQ:
+//   1000 Hz is a good starting point for IBT-2 motor control
+//
+// PWM_RES:
+//   8-bit gives a duty range from 0 to 255
+//
+const int PWM_FREQ = 1000;
+const int PWM_RES  = 8;
+const int PWM_MAX  = 255;
+
+// -------------------------
+// Ramp settings
+// -------------------------
+//
+// These values control how quickly the PWM changes.
+//
+// PWM_STEP_UP:
+//   How fast output increases toward target
+//
+// PWM_STEP_DOWN:
+//   How fast output decreases toward target
+//
+// Smaller values = smoother / softer response
+// Larger values  = faster / snappier response
+//
+// For a slow, scale-like boat feel, use smaller numbers.
+// For a more aggressive response, use larger numbers.
+//
+const int PWM_STEP_UP   = 4;
+const int PWM_STEP_DOWN = 8;
+
+// -------------------------
+// Main loop timing
+// -------------------------
+// Increase for slower updates, reduce for quicker response.
+// 15 ms is a good compromise.
+const int LOOP_DELAY_MS = 15;
+
+// -------------------------
+// Runtime state variables
+// -------------------------
+
+// true when we are currently in the neutral stop zone
+bool inStopZone = true;
+
+// current actual PWM being sent to the motor
+int currentPwm = 0;
+
+// desired PWM based on stick position
+int targetPwm = 0;
+
+// current actual direction:
+// -1 = reverse, 0 = stop, +1 = forward
+int direction = 0;
+
+// desired direction from stick position
+int targetDir = 0;
+
+// ============================================================
+// SETUP
+// ============================================================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  pinMode(PIN_RC, INPUT);
+
+  pinMode(PIN_REN, OUTPUT);
+  pinMode(PIN_LEN, OUTPUT);
+
+  // Enable both halves of the IBT-2 driver
+  digitalWrite(PIN_REN, HIGH);
+  digitalWrite(PIN_LEN, HIGH);
+
+  // Attach PWM outputs to pins
+  ledcAttach(PIN_RPWM, PWM_FREQ, PWM_RES);
+  ledcAttach(PIN_LPWM, PWM_FREQ, PWM_RES);
+
+  stopMotor();
+
+  Serial.println("S2_IBT2_RC_SMOOTH_SIDEWHEELER_V1 READY");
+}
+
+// ============================================================
+// MAIN LOOP
+// ============================================================
+void loop() {
+  // Read one RC pulse in microseconds
+  int rc = pulseIn(PIN_RC, HIGH, 30000);
+
+  // If pulse is missing or wildly invalid, stop safely
+  if (rc < 800 || rc > 2300) {
+    targetPwm = 0;
+    targetDir = 0;
+    inStopZone = true;
+    updateMotorSmooth();
+    Serial.println("NO SIGNAL");
+    delay(LOOP_DELAY_MS);
+    return;
+  }
+
+  // --------------------------------------------------------
+  // Neutral hysteresis logic
+  // --------------------------------------------------------
+  //
+  // If currently stopped:
+  //   stay stopped until stick moves clearly outside the exit band
+  //
+  // If currently moving:
+  //   keep moving until stick returns into the narrower enter band
+  //
+  if (inStopZone) {
+    if (rc > STOP_EXIT_HIGH || rc < STOP_EXIT_LOW) {
+      inStopZone = false;
+    }
+  } else {
+    if (rc >= STOP_ENTER_LOW && rc <= STOP_ENTER_HIGH) {
+      inStopZone = true;
+    }
+  }
+
+  // --------------------------------------------------------
+  // Convert stick position into target direction and target PWM
+  // --------------------------------------------------------
+  //
+  // If in stop zone:
+  //   target = stopped
+  //
+  // If above center:
+  //   target = forward
+  //
+  // If below center:
+  //   target = reverse
+  //
+  if (inStopZone) {
+    targetDir = 0;
+    targetPwm = 0;
+  }
+  else if (rc > 1500) {
+    targetDir = 1;
+    targetPwm = map(rc, STOP_EXIT_HIGH, RC_MAX, 0, PWM_MAX);
+    targetPwm = constrain(targetPwm, 0, PWM_MAX);
+  }
+  else {
+    targetDir = -1;
+    targetPwm = map(rc, STOP_EXIT_LOW, RC_MIN, 0, PWM_MAX);
+    targetPwm = constrain(targetPwm, 0, PWM_MAX);
+  }
+
+  // Smoothly move current output toward target output
+  updateMotorSmooth();
+
+  // Serial monitor output for setup and tuning
+  Serial.print("RC=");
+  Serial.print(rc);
+  Serial.print("  targetDir=");
+  Serial.print(targetDir);
+  Serial.print("  targetPwm=");
+  Serial.print(targetPwm);
+  Serial.print("  currentDir=");
+  Serial.print(direction);
+  Serial.print("  currentPwm=");
+  Serial.println(currentPwm);
+
+  delay(LOOP_DELAY_MS);
+}
+
+// ============================================================
+// updateMotorSmooth()
+// ============================================================
+// This function makes the motor response smooth.
+//
+// If changing direction:
+//   first ramp current PWM down to zero
+//   then switch direction
+//
+// If staying in the same direction:
+//   gradually move currentPwm toward targetPwm
+//
+// This prevents hard reversals and removes twitchiness.
+// ============================================================
+void updateMotorSmooth() {
+  // If target direction is different from current direction,
+  // always reduce current PWM to zero before reversing.
+  if (direction != targetDir) {
+    if (currentPwm > 0) {
+      currentPwm -= PWM_STEP_DOWN;
+      if (currentPwm < 0) currentPwm = 0;
+      applyMotor(direction, currentPwm);
+      return;
+    } else {
+      direction = targetDir;
+    }
+  }
+
+  // Same direction: smoothly approach target PWM
+  if (currentPwm < targetPwm) {
+    currentPwm += PWM_STEP_UP;
+    if (currentPwm > targetPwm) currentPwm = targetPwm;
+  }
+  else if (currentPwm > targetPwm) {
+    currentPwm -= PWM_STEP_DOWN;
+    if (currentPwm < targetPwm) currentPwm = targetPwm;
+  }
+
+  applyMotor(direction, currentPwm);
+}
+
+// ============================================================
+// applyMotor(dir, pwm)
+// ============================================================
+// Sends the actual PWM to the motor driver.
+//
+// dir =  1  -> forward on RPWM
+// dir = -1  -> reverse on LPWM
+// dir =  0  -> stop
+// ============================================================
+void applyMotor(int dir, int pwm) {
+  pwm = constrain(pwm, 0, PWM_MAX);
+
+  if (dir == 0 || pwm == 0) {
+    stopMotor();
+  }
+  else if (dir > 0) {
+    ledcWrite(PIN_RPWM, pwm);
+    ledcWrite(PIN_LPWM, 0);
+  }
+  else {
+    ledcWrite(PIN_RPWM, 0);
+    ledcWrite(PIN_LPWM, pwm);
+  }
+}
+
+// ============================================================
+// stopMotor()
+// ============================================================
+// Turns both PWM outputs off.
+// ============================================================
+void stopMotor() {
+  ledcWrite(PIN_RPWM, 0);
+  ledcWrite(PIN_LPWM, 0);
+}
